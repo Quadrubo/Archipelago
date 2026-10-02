@@ -1,7 +1,7 @@
 # Peggle Deluxe Randomizer Setup Guide
 
 ## Requirements
-- Windows OS (Hard required. Client is using memory reading / writing / allocation through Windows APIs)
+- Windows, or Linux with Peggle Deluxe running through Proton / Wine (see [Linux](#linux) below)
 - Peggle Deluxe installed through Steam
   - Only the English version is supported. Other languages use different executables. 
   - The language can be changed in Properties -> General on Steam
@@ -29,6 +29,12 @@ Once the Archipelago client is connected, hooks and patches will be set up in th
 **Notes** 
 - You don't need to have completed Adventure Mode to play. The client will be able to unlock the Quick Play levels as needed regardless of Adventure progress.
 - Fever Meter Multiplier location checks will send when you hit the next peg after reaching the multiplier in the fever meter
+
+## Linux
+Run Peggle Deluxe through Steam with Proton and use the native Linux Archipelago client. The client attaches to the game through `/proc/<pid>/mem`, so:
+- The client must run as the same user as the game
+- The client must not run inside a sandbox with its own user namespace (e.g. Flatpak or bubblewrap based wrappers), or the game's memory will not be accessible
+- Tested with Steam and Proton, where `kernel.yama.ptrace_scope` set to `0` or `1` works. Plain Wine without Proton is untested and likely needs `ptrace_scope` set to `0`
 
 ## Joining a Multiworld Game
 - Launch Peggle Deluxe and either sit on the splash screen or advance to the main menu

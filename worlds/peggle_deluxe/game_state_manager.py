@@ -1,13 +1,18 @@
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import ctypes
+import logging
 import random
 import struct
+import sys
 
-from pymem import Pymem
-from pymem.process import close_handle, list_processes
-from pymem.ressources.kernel32 import VirtualProtectEx
-from pymem.ressources.structure import ProcessEntry32
+if sys.platform == "win32":
+    from pymem import Pymem
+    from pymem.process import close_handle, list_processes
+    from pymem.ressources.kernel32 import VirtualProtectEx
+    from pymem.ressources.structure import ProcessEntry32
+else:
+    from .linux_process import LinuxProcess
 
 from .data.mapping_data import id_to_characters, level_to_peg_count, level_to_stage_levels, stage_level_to_levels
 
@@ -19,6 +24,8 @@ from .enums import (
     PeggleDeluxeLevelStates,
     PeggleDeluxePegColors,
 )
+
+logger: logging.Logger = logging.getLogger("Client")
 
 
 class GameState(NamedTuple):
@@ -60,8 +67,9 @@ class GameStateManager:
     signature_address: int = 0x288BCC
     signature_string: str = "Peggle"
 
-    process: Optional[Pymem]
+    process: Optional[Union["Pymem", "LinuxProcess"]]
     is_process_running: bool
+    has_warned_about_memory_access: bool
 
     thunderball_app_address: Optional[int]
     player_info_address: Optional[int]
@@ -84,6 +92,7 @@ class GameStateManager:
     def __init__(self) -> None:
         self.process = None
         self.is_process_running = False
+        self.has_warned_about_memory_access = False
 
         self.thunderball_app_address = None
         self.player_info_address = None
@@ -689,18 +698,27 @@ class GameStateManager:
         try:
             candidate_pids: List[int] = list()
 
-            process: ProcessEntry32
-            for process in list_processes():
-                if self.process_name.lower() in process.szExeFile.decode("utf-8").lower():
-                    candidate_pids.append(process.th32ProcessID)
+            if sys.platform == "win32":
+                process: ProcessEntry32
+                for process in list_processes():
+                    if self.process_name.lower() in process.szExeFile.decode("utf-8").lower():
+                        candidate_pids.append(process.th32ProcessID)
+            else:
+                candidate_pids = LinuxProcess.list_pids(self.process_name)
 
             if not len(candidate_pids):
                 return False
 
             pid: int
             for pid in candidate_pids:
+                linux_process: Optional[LinuxProcess] = None
+
                 try:
-                    process: Pymem = Pymem(pid)
+                    if sys.platform == "win32":
+                        process: Pymem = Pymem(pid)
+                    else:
+                        process = linux_process = LinuxProcess(pid, self.process_name)
+
                     address: int = process.base_address + self.signature_address
 
                     if process.read_string(address, len(self.signature_string)) == self.signature_string:
@@ -708,8 +726,20 @@ class GameStateManager:
                         self.is_process_running = True
 
                         break
+                except PermissionError:
+                    if not self.has_warned_about_memory_access:
+                        logger.warning(
+                            "Found a PopCap game process but could not access its memory. The client must run as "
+                            "the same user as Peggle Deluxe and outside of sandboxes like Flatpak, and "
+                            "kernel.yama.ptrace_scope may need to be lowered. See the setup guide for details."
+                        )
+
+                        self.has_warned_about_memory_access = True
                 except Exception:
                     pass
+
+                if linux_process is not None:
+                    linux_process.close()
 
             if not self.is_process_running:
                 return False
@@ -720,22 +750,35 @@ class GameStateManager:
             self.logic_manager_address = self.logic_manager_struct_address
 
             if include_hooks_patches:
-                self.install_level_lock_hook()
-                self.install_character_lock_hook()
-                self.install_orange_peg_cap_hook()
-                self.install_fever_multiplier_init_hook()
-                self.install_fever_multiplier_hook()
-                self.install_fever_multiplier_calculation_hook()
-                self.install_fever_meter_fill_hook()
+                did_install_all: bool = True
 
-                self.install_starting_ball_count_patch()
+                did_install_all &= self.install_level_lock_hook()
+                did_install_all &= self.install_character_lock_hook()
+                did_install_all &= self.install_orange_peg_cap_hook()
+                did_install_all &= self.install_fever_multiplier_init_hook()
+                did_install_all &= self.install_fever_multiplier_hook()
+                did_install_all &= self.install_fever_multiplier_calculation_hook()
+                did_install_all &= self.install_fever_meter_fill_hook()
+
+                did_install_all &= self.install_starting_ball_count_patch()
+
+                if not did_install_all:
+                    logger.warning(
+                        "Some hooks and patches could not be installed, so Peggle Deluxe will not behave as expected. "
+                        "Restart Peggle Deluxe and reconnect the client."
+                    )
         except Exception:
             return False
 
         return True
 
     def close_process_handle(self) -> bool:
-        if close_handle(self.process.process_handle):
+        if sys.platform == "win32":
+            did_close: bool = close_handle(self.process.process_handle)
+        else:
+            did_close: bool = self.process.close()
+
+        if did_close:
             self.is_process_running = False
             self.process = None
 
@@ -752,6 +795,9 @@ class GameStateManager:
         try:
             self.process.read_int(self.process.base_address)
         except Exception:
+            if sys.platform != "win32" and self.process is not None:
+                self.process.close()
+
             self.is_process_running = False
             self.process = None
 
@@ -1497,6 +1543,11 @@ class GameStateManager:
         return b"".join(instruction_bytes)
 
     def _write_executable_bytes(self, address: int, data: bytes) -> bool:
+        if sys.platform != "win32":
+            self.process.write_bytes(address, data, len(data))
+
+            return True
+
         previous_protection: ctypes.c_ulong = ctypes.c_ulong(0)
 
         did_change_protection: bool = bool(
